@@ -1,0 +1,163 @@
+(declaim (optimize debug))
+
+(require 'cl-libsvm)
+(require 'cl-ppcre)
+
+(defstruct entry id malignant data)
+(defstruct data-set train cross-validation test)
+(defstruct performance accuracy precision recall)
+
+(defun vec-max (vec1 vec2)
+  (mapcar #'max vec1 vec2))
+
+(defun vec-min (vec1 vec2)
+  (mapcar #'min vec1 vec2))
+
+(defun find-min-max-values (entries)
+  (let* ((max-vals (entry-data (car entries)))
+         (min-vals max-vals))
+    (dolist (cur-entry (cdr entries))
+      (let ((cur-data (entry-data cur-entry)))
+        (dotimes (i (length cur-data))
+          (setf max-vals (vec-max max-vals cur-data))
+          (setf min-vals (vec-min min-vals cur-data)))))
+    (values min-vals max-vals)))
+
+(defun make-val-map-funcs (min-vals max-vals)
+  (mapcar (lambda (min max) 
+            (let* ((range (- max min)))
+              (lambda (x) (/ (- x min) range))))
+          min-vals
+          max-vals))
+
+(defun map-entry-data (entry val-map-funcs)
+  (let* ((data (entry-data entry))
+         (new-data (mapcar #'funcall val-map-funcs data)))
+    (make-entry :id (entry-id entry)
+                :malignant (entry-malignant entry)
+                :data new-data)))
+
+(defun normalize (entries)
+  "returns list of functions to maps new values to normalized values and normalized entries"
+  (multiple-value-bind (min-vals max-vals) (find-min-max-values entries)
+    (let* ((val-map-funcs (make-val-map-funcs min-vals max-vals))
+           (norm-entries (mapcar (lambda (entry) 
+                                   (map-entry-data entry val-map-funcs))
+                                 entries)))
+      (values val-map-funcs
+              norm-entries))))
+
+(defun parse-entries (data-path)
+  (let (entries)
+    (with-open-file (in data-path)
+      (loop for line = (read-line in nil)
+         until (null line) 
+         do 
+           (let* ((fields (cl-ppcre:split "," line))
+                  (malignant (string-equal (second fields) "M"))
+                  (sfloats (mapcar 'read-from-string (cddr fields)))
+                  (dfloats (mapcar (lambda (x) (coerce x 'double-float)) 
+                                   sfloats))
+                  (new-entry (make-entry :id (first fields)
+                                         :malignant malignant
+                                         :data dfloats)))
+             (setf entries (cons new-entry entries)))))
+    entries))
+
+(defun split-entries (entries)
+  (let* ((count (length entries))
+         (train-end (floor (* count 0.6d0)))
+         (cv-end (floor (* count 0.8d0))))
+    (make-data-set :train (subseq entries 0 train-end)
+                   :cross-validation (subseq entries train-end cv-end)
+                   :test (subseq entries cv-end count))))
+
+(defun doub-div (num den)
+  (if (= den 0)
+      0.0d0
+      (coerce (/ num den) 'double-float)))
+
+(defun calc-performance (func entries)
+  (let ((true-pos 0)
+        (true-neg 0)
+        (false-pos 0)
+        (false-neg 0))
+    (dolist (entry entries)
+      (let* ((data-vec (make-sparse-vector (entry-data entry)))
+             (prediction (funcall func data-vec)))
+        (if prediction
+            (if (entry-malignant entry)
+                (incf true-pos)
+                (incf false-pos))
+            (if (entry-malignant entry)
+                (incf false-neg)
+                (incf true-neg)))))
+    (make-performance :accuracy (doub-div (+ true-pos true-neg) (length entries))
+                      :precision (doub-div true-pos (+ true-pos false-pos))
+                      :recall (doub-div true-pos (+ true-pos false-neg)))))
+
+(defun make-sparse-vector (vec)
+  (labels ((rec (i loc)
+             (when (not (null loc))
+               (cons (cons i (car loc)) 
+                     (rec (1+ i) (cdr loc))))))
+    (coerce (rec 1 vec) 'vector)))
+
+(defun calc-f1-score (func entries)
+  (let ((perf (calc-performance func entries)))
+    (doub-div (* 2.0d0 (performance-precision perf) (performance-recall perf))
+              (+ (performance-precision perf) (performance-recall perf)))))
+
+(defun make-predicter (model)
+  (lambda (x) 
+    (let ((pred (cl-libsvm:predict model x)))
+      (> pred 0.0d0))))
+
+(defun find-best-parameters (cv-set problem)
+  (let* ((clist (list 0.01d0 0.03d0 
+                      0.1d0  0.3d0
+                      1.0d0  3.0d0
+                      10.0d0 30.0d0))
+         (gamma-list (list 0.01d0 0.03d0 
+                           0.1d0  0.3d0
+                           1.0d0  3.0d0
+                           10.0d0 30.0d0))
+         (ans-c 0.0d0)
+         (ans-gamma 0.0d0)
+         (ans-f1 0.0d0))
+    (dolist (c-value clist)
+      (dolist (gamma gamma-list)
+        (let* ((param (cl-libsvm:make-parameter :c c-value :gamma gamma))
+               (model (cl-libsvm:train problem param))
+               (predicter (make-predicter model))
+               (f1 (calc-f1-score predicter cv-set)))
+          (when (> f1 ans-f1)
+            (setf ans-c c-value)
+            (setf ans-gamma gamma)
+            (setf ans-f1 f1)))))
+    (format t "best c:~a gamma:~a f1:~a~%" ans-c ans-gamma ans-f1)
+    (cl-libsvm:make-parameter :c ans-c :gamma ans-gamma)))
+
+(defun run (data-path)
+  (let ((entries (parse-entries data-path)))
+    (multiple-value-bind (val-map-funcs norm-entries) (normalize entries)
+      (let* ((data-set (split-entries norm-entries))
+             (outputs (map 'vector (lambda (entry) 
+                                     (if (entry-malignant entry) 1 -1)) 
+                           (data-set-train data-set)))
+             (inputs (map 'vector (lambda (entry)
+                                    (make-sparse-vector (entry-data entry)))
+                          (data-set-train data-set)))
+             (prob (cl-libsvm:make-problem outputs inputs))
+             (param (find-best-parameters (data-set-cross-validation data-set) 
+                                         prob))
+             (model (cl-libsvm:train prob param))
+             (predicter (make-predicter model))
+             (performance (calc-performance predicter 
+                                            (data-set-test data-set))))
+        (format t "accuracy:~a~%" (performance-accuracy performance))
+        (format t "precision:~a~%" (performance-precision performance))
+        (format t "recall:~a~%" (performance-recall performance))
+        (lambda (entry) 
+          (let ((mapped-entry (map-entry-data entry val-map-funcs)))
+            (funcall predicter (entry-data mapped-entry))))))))
